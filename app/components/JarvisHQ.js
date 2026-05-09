@@ -495,8 +495,11 @@ function AcademyTab({ campuses, setCampuses }) {
 // ââââââââââââââââââââââââââââââââââââââââââââââââââ
 // TAB: HEALTH (VITALS)
 // ââââââââââââââââââââââââââââââââââââââââââââââââââ
-function HealthTab({ log, setLog }) {
+function HealthTab({ log, setLog, healthSync, setHealthSync }) {
   const [input, setInput] = useState("");
+  const [importMsg, setImportMsg] = useState(null);
+  const [importing, setImporting] = useState(false);
+  const fileRef = useRef(null);
   const target = 100;
 
   const add = () => {
@@ -506,6 +509,59 @@ function HealthTab({ log, setLog }) {
     setInput("");
   };
   const remove = (t) => setLog(log.filter(e => e.t !== t));
+
+  const importAppleHealth = (file) => {
+    if (!file) return;
+    setImporting(true);
+    setImportMsg({ kind: "info", text: "PARSING EXPORT..." });
+    const reader = new FileReader();
+    reader.onerror = () => {
+      setImporting(false);
+      setImportMsg({ kind: "err", text: "FILE READ FAILED" });
+    };
+    reader.onload = (ev) => {
+      try {
+        const doc = new DOMParser().parseFromString(ev.target.result, "text/xml");
+        const parseErr = doc.querySelector("parsererror");
+        if (parseErr) throw new Error("INVALID XML — extract export.zip and select export.xml");
+        const records = doc.querySelectorAll('Record[type="HKQuantityTypeIdentifierBodyMass"]');
+        if (!records.length) throw new Error("NO BODYMASS RECORDS FOUND IN EXPORT");
+
+        // Latest reading per day, normalized to kg
+        const byDay = new Map();
+        records.forEach(r => {
+          const dateStr = r.getAttribute("startDate") || r.getAttribute("creationDate");
+          const raw = parseFloat(r.getAttribute("value"));
+          const unit = (r.getAttribute("unit") || "kg").toLowerCase();
+          if (!dateStr || !isFinite(raw)) return;
+          const t = new Date(dateStr).getTime();
+          if (!isFinite(t)) return;
+          const kg = unit === "lb" ? raw * 0.45359237 : raw;
+          const dayKey = new Date(t).toLocaleDateString("ko-KR");
+          const prev = byDay.get(dayKey);
+          if (!prev || t > prev.t) byDay.set(dayKey, { d: dayKey, kg: Math.round(kg * 10) / 10, t });
+        });
+
+        // Merge: keep manual entries, only add days we don't already have
+        const existingDays = new Set(log.map(e => e.d));
+        const incoming = Array.from(byDay.values()).filter(e => !existingDays.has(e.d));
+        const merged = [...log, ...incoming].sort((a, b) => a.t - b.t).slice(-90);
+
+        setLog(merged);
+        setHealthSync({ at: Date.now(), count: byDay.size, added: incoming.length });
+        setImportMsg({
+          kind: "ok",
+          text: `IMPORTED ${byDay.size} DAYS · ${incoming.length} NEW · ${byDay.size - incoming.length} ALREADY LOGGED`,
+        });
+      } catch (err) {
+        setImportMsg({ kind: "err", text: (err.message || "IMPORT FAILED").toUpperCase() });
+      } finally {
+        setImporting(false);
+        if (fileRef.current) fileRef.current.value = "";
+      }
+    };
+    reader.readAsText(file);
+  };
 
   const latest = log[log.length - 1];
   const weekAgo = log.length >= 7 ? log[log.length - 7] : log[0];
@@ -626,6 +682,61 @@ function HealthTab({ log, setLog }) {
           fontFamily: "inherit", letterSpacing: 2,
         }}>LOG</button>
       </div>
+
+      {/* Apple Health Sync */}
+      <HudPanel accent={C.cyan} style={{ marginBottom: 14 }}>
+        <HudHdr
+          icon={"⌖"}
+          title="APPLE HEALTH SYNC"
+          color={C.cyan}
+          status={healthSync?.at ? "LINKED" : null}
+        />
+        <div style={{ fontSize: 9, color: C.mid, lineHeight: 1.6, marginBottom: 8, letterSpacing: 0.5 }}>
+          {"iOS Health app → Profile → Export All Health Data. Unzip "}
+          <span style={{ color: C.cyan }}>export.zip</span>
+          {" and select "}
+          <span style={{ color: C.cyan }}>export.xml</span>
+          {" below. BodyMass records merge into your weight log; manual entries are preserved."}
+        </div>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".xml,application/xml,text/xml"
+          onChange={e => importAppleHealth(e.target.files?.[0])}
+          style={{ display: "none" }}
+        />
+        <button
+          onClick={() => fileRef.current?.click()}
+          disabled={importing}
+          style={{
+            width: "100%", padding: "10px 14px", borderRadius: 2,
+            border: `1px solid ${C.cyan}60`,
+            background: `linear-gradient(180deg, ${C.cyan}18 0%, ${C.cyan}06 100%)`,
+            color: C.cyan, fontSize: 11, fontWeight: 800,
+            cursor: importing ? "wait" : "pointer", fontFamily: "inherit",
+            letterSpacing: 2, opacity: importing ? 0.6 : 1,
+          }}
+        >
+          {importing ? "SCANNING..." : "SELECT export.xml"}
+        </button>
+        {importMsg && (
+          <div style={{
+            marginTop: 8, padding: "6px 8px", borderRadius: 2, fontSize: 9, letterSpacing: 1,
+            background: importMsg.kind === "ok" ? `${C.green}10`
+              : importMsg.kind === "err" ? `${C.red}10` : `${C.cyan}10`,
+            color: importMsg.kind === "ok" ? C.green
+              : importMsg.kind === "err" ? C.red : C.cyan,
+            border: `1px solid ${(importMsg.kind === "ok" ? C.green : importMsg.kind === "err" ? C.red : C.cyan)}30`,
+          }}>
+            {importMsg.text}
+          </div>
+        )}
+        {healthSync?.at && !importMsg && (
+          <div style={{ marginTop: 6, fontSize: 8, color: C.dim, letterSpacing: 1 }}>
+            {`LAST SYNC · ${new Date(healthSync.at).toLocaleString("ko-KR")} · ${healthSync.count} DAYS`}
+          </div>
+        )}
+      </HudPanel>
 
       {/* History */}
       {log.length > 0 && (
@@ -986,21 +1097,24 @@ export default function JarvisHQ() {
   const [todos, setTodosRaw] = useState([]);
   const [rev, setRevRaw] = useState({ gn: 0, jg: 0, ds: 0 });
   const [revHist, setRevHistRaw] = useState([]);
+  const [healthSync, setHealthSyncRaw] = useState(null);
 
   const setCampuses = c => { setCampusesRaw(c); S.set("hq-camp3", c); };
   const setLog = l => { setLogRaw(l); S.set("hq-weight3", l); };
   const setTodos = t => { setTodosRaw(t); S.set("hq-todos3", t); };
   const setRev = r => { setRevRaw(r); S.set("hq-rev3", r); };
   const setRevHist = h => { setRevHistRaw(h); S.set("hq-revh3", h); };
+  const setHealthSync = h => { setHealthSyncRaw(h); S.set("hq-healthsync", h); };
 
   useEffect(() => {
     Promise.all([
       S.get("hq-camp3", null), S.get("hq-weight3", []),
       S.get("hq-todos3", []), S.get("hq-rev3", { gn: 0, jg: 0, ds: 0 }),
-      S.get("hq-revh3", []),
-    ]).then(([c, w, t, r, rh]) => {
+      S.get("hq-revh3", []), S.get("hq-healthsync", null),
+    ]).then(([c, w, t, r, rh, hs]) => {
       if (c) setCampusesRaw(c);
       setLogRaw(w); setTodosRaw(t); setRevRaw(r); setRevHistRaw(rh);
+      setHealthSyncRaw(hs);
       setLoaded(true);
     });
   }, []);
@@ -1012,7 +1126,7 @@ export default function JarvisHQ() {
     switch (tab) {
       case "dash": return <DashTab campuses={campuses} log={log} todos={todos} rev={rev} greeting={greeting} />;
       case "academy": return <AcademyTab campuses={campuses} setCampuses={setCampuses} />;
-      case "health": return <HealthTab log={log} setLog={setLog} />;
+      case "health": return <HealthTab log={log} setLog={setLog} healthSync={healthSync} setHealthSync={setHealthSync} />;
       case "tasks": return <TasksTab todos={todos} setTodos={setTodos} />;
       case "revenue": return <RevenueTab rev={rev} setRev={setRev} revHist={revHist} setRevHist={setRevHist} />;
       case "invest": return <InvestTab />;
